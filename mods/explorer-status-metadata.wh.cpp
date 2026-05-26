@@ -66,6 +66,11 @@ is selected: dimensions, modification date, file type, duration, bitrate, fps.
   CWM_GETISHELLBROWSER broadcast to arbitrary windows
 - CWM_GETISHELLBROWSER is now sent only to windows of known safe classes:
   CabinetWClass and ShellTabWindowClass
+- SafeGetShellBrowser: thread-ID guard replaced with process-ID guard.
+  PSFormatForDisplayAlloc fires on a shell worker thread (not the GUI thread),
+  so the thread-ID check always failed and GetSelectedFilePath always returned
+  empty. Process-ID check is sufficient and works correctly from any thread.
+- Added Wh_Log to Wh_ModInit/Wh_ModUninit for basic injection diagnostics
 - Added Wh_ModSettingsChanged so settings take effect without restarting Explorer
 - Cache upgraded from FIFO to true LRU: cache hits now move the entry to the
   back of the eviction queue, keeping frequently-accessed files safe from eviction
@@ -569,8 +574,13 @@ static std::wstring ExtractPathFromBrowser(IShellBrowser* pSB)
 static IShellBrowser* SafeGetShellBrowser(HWND h)
 {
     if (!h) return nullptr;
-    // Guard 1: must belong to the current thread (same Explorer instance)
-    if (GetWindowThreadProcessId(h, nullptr) != GetCurrentThreadId())
+    // Guard 1: must belong to the current process.
+    // PSFormatForDisplayAlloc fires on a shell worker thread, not the GUI thread,
+    // so GetCurrentThreadId() never matches the window's thread. Process-ID check
+    // is sufficient to prevent sending CWM_GETISHELLBROWSER to other processes.
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId())
         return nullptr;
     // Guard 2: must be a known-safe class
     wchar_t cls[64] = {};
@@ -939,18 +949,20 @@ static void LoadSettings()
 
 BOOL Wh_ModInit()
 {
+    Wh_Log(L"Wh_ModInit: starting");
     LoadSettings();
 
     InitializeCriticalSection(&g_cs);
 
     HMODULE hPS = GetModuleHandleW(L"propsys.dll");
     if (!hPS) hPS = LoadLibraryW(L"propsys.dll");
-    if (!hPS) return FALSE;
+    if (!hPS) { Wh_Log(L"Wh_ModInit: FAILED — propsys.dll not found"); return FALSE; }
 
     void* pfn = (void*)GetProcAddress(hPS, "PSFormatForDisplayAlloc");
-    if (!pfn) return FALSE;
+    if (!pfn) { Wh_Log(L"Wh_ModInit: FAILED — PSFormatForDisplayAlloc not found"); return FALSE; }
 
     Wh_SetFunctionHook(pfn, (void*)Hook_PSF, (void**)&g_origPSF);
+    Wh_Log(L"Wh_ModInit: hook set — OK");
     return TRUE;
 }
 
@@ -967,6 +979,7 @@ void Wh_ModSettingsChanged()
 
 void Wh_ModUninit()
 {
+    Wh_Log(L"Wh_ModUninit: unloading");
     EnterCriticalSection(&g_cs);
     g_metaCache.clear();
     g_cacheOrder.clear();
